@@ -7,63 +7,36 @@ uvicorn instance on an ephemeral port, using a temporary SQLite database.
 from __future__ import annotations
 
 import asyncio
-import socket
-import threading
 import time
 
 import pytest
-import uvicorn
 
 from app.db import Repository
 from app.governor import OriginGovernor
 from app.worker import Worker
-
-
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
-class DemoServer:
-    def __init__(self) -> None:
-        import demo.source as source
-
-        self.app = source.create_app("demo-test")
-        self.port = _free_port()
-        config = uvicorn.Config(
-            self.app, host="127.0.0.1", port=self.port, log_level="warning"
-        )
-        self.server = uvicorn.Server(config)
-        self.thread = threading.Thread(target=self.server.run, daemon=True)
-
-    def __enter__(self) -> "DemoServer":
-        self.thread.start()
-        deadline = time.time() + 10
-        while not self.server.started and time.time() < deadline:
-            time.sleep(0.02)
-        assert self.server.started, "demo server did not start"
-        return self
-
-    def __exit__(self, *exc) -> None:
-        self.server.should_exit = True
-        self.thread.join(timeout=5)
-
-    def url(self, path: str) -> str:
-        return f"http://127.0.0.1:{self.port}{path}"
-
-    def requests(self) -> list[dict]:
-        return self.app.state.log.all()
-
-    def reset(self) -> None:
-        self.app.state.log.clear()
-        self.app.state.counter.reset()
+from tests.demo_server import DemoServer
 
 
 @pytest.fixture()
 def demo():
     with DemoServer() as server:
         yield server
+
+
+@pytest.fixture()
+def demo_wild():
+    """A demo server reachable as 127.0.0.1 … 127.0.0.17 (many origins)."""
+    with DemoServer(host="0.0.0.0") as server:
+        yield server
+
+
+def multi_origin_urls(port: int, count: int, path: str) -> list[tuple[str, str]]:
+    """``count`` distinct origins (127.0.0.1 …) serving the same path."""
+    out = []
+    for i in range(1, count + 1):
+        url = f"http://127.0.0.{i}:{port}{path}"
+        out.append((url, _origin(url)))
+    return out
 
 
 def make_worker(tmp_path, name="w1", **kwargs) -> tuple[Worker, Repository]:
@@ -337,6 +310,141 @@ def test_two_workers_share_pacing(demo, tmp_path):
     for earlier, later in zip(entries, entries[1:]):
         assert later["received_at"] - earlier["received_at"] >= 1.0
         assert later["received_at"] >= earlier["finished_at"] - 0.001, "同源请求重叠"
+
+
+def test_pool_queueing_keeps_same_origin_spacing(demo_wild, tmp_path):
+    """The reported bug: 8 slow origins fill the 8 connections, a 9th origin
+    queues for a connection — its two fast articles must still actually start
+    at least one second apart (the anchor is stamped at real dispatch time,
+    not when the request entered the queue)."""
+    worker, repo = make_worker(tmp_path, name="w1")
+    port = demo_wild.port
+    slow = multi_origin_urls(port, 8, "/article/alpha?delay=2.4")
+    fast_host = f"127.0.0.9:{port}"
+    fast = [
+        (f"http://{fast_host}/article/beta", f"http://{fast_host}"),
+        (f"http://{fast_host}/article/gamma", f"http://{fast_host}"),
+    ]
+    batch_id = repo.create_batch(slow + fast)
+
+    async def scenario():
+        task = asyncio.create_task(worker.run())
+        try:
+            return await run_until(repo, batch_id, timeout=40)
+        finally:
+            worker.request_stop()
+            await asyncio.wait_for(task, timeout=5)
+
+    batch = asyncio.run(scenario())
+    assert all(p["status"] == "ok" for p in batch["pages"]), batch["pages"]
+    entries = sorted(
+        (e for e in demo_wild.requests() if e["host"] == fast_host),
+        key=lambda e: e["received_at"],
+    )
+    assert len(entries) == 2, entries
+    gap = entries[1]["received_at"] - entries[0]["received_at"]
+    assert gap >= 0.99, f"连接池排队后同源实际间隔不足 1 秒：{gap:.3f}s"
+    assert entries[1]["received_at"] >= entries[0]["finished_at"] - 0.001, "同源请求重叠"
+
+
+def test_cancel_while_queued_for_connection_never_sends(demo_wild, tmp_path):
+    """Cancel while the request waits for a connection: the origin must never
+    be hit, and the freed slot lets a later batch on the same origin run."""
+    worker, repo = make_worker(tmp_path, name="w1")
+    port = demo_wild.port
+    slow = multi_origin_urls(port, 8, "/article/delta?delay=2.4")
+    fast_host = f"127.0.0.9:{port}"
+    fast_url = f"http://{fast_host}/article/epsilon"
+    repo.create_batch(slow)
+    batch_id = repo.create_batch([(fast_url, f"http://{fast_host}")])
+
+    async def scenario():
+        task = asyncio.create_task(worker.run())
+        try:
+            # Wait until the fast page is claimed and queued for a connection.
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                page = repo.get_batch(batch_id)["pages"][0]
+                if page["status"] == "running":
+                    break
+                await asyncio.sleep(0.02)
+            else:
+                raise AssertionError("fast page was never claimed")
+            repo.cancel_batch(batch_id)
+            batch = await run_until(repo, batch_id, timeout=15)
+            # Give a (hypothetically leaking) queued request time to escape.
+            await asyncio.sleep(3.0)
+            return batch
+        finally:
+            worker.request_stop()
+            await asyncio.wait_for(task, timeout=5)
+
+    batch = asyncio.run(scenario())
+    assert batch["pages"][0]["status"] == "cancelled"
+    leaked = [e for e in demo_wild.requests() if e["host"] == fast_host]
+    assert leaked == [], f"取消后仍访问了源站：{leaked}"
+
+    # The cancelled page released its occupancy: a new batch on the same
+    # origin is collected without waiting for a stale reservation.
+    followup_id = repo.create_batch([(fast_url, f"http://{fast_host}")])
+    worker2 = Worker(
+        repo,
+        OriginGovernor(str(tmp_path / "corpus.db"), owner="w1", min_interval=1.0),
+        name="w1",
+    )
+
+    async def followup():
+        task = asyncio.create_task(worker2.run())
+        try:
+            return await run_until(repo, followup_id, timeout=20)
+        finally:
+            worker2.request_stop()
+            await asyncio.wait_for(task, timeout=5)
+
+    follow = asyncio.run(followup())
+    assert follow["pages"][0]["status"] == "ok"
+    assert [e for e in demo_wild.requests() if e["host"] == fast_host]
+
+
+def test_pool_queueing_two_workers_share_pacing(demo_wild, tmp_path):
+    """Dual collectors under full connection pressure: 16 slow origins fill
+    both processes' 8 connections; the 17th origin's two fast articles must
+    not overlap and must actually start >= 1s apart across the processes."""
+    db = str(tmp_path / "corpus.db")
+    repo = Repository(db)
+    port = demo_wild.port
+    slow = multi_origin_urls(port, 16, "/article/zeta?delay=2.4")
+    fast_host = f"127.0.0.17:{port}"
+    fast = [
+        (f"http://{fast_host}/article/alpha", f"http://{fast_host}"),
+        (f"http://{fast_host}/article/beta", f"http://{fast_host}"),
+    ]
+    batch_id = repo.create_batch(slow + fast)
+
+    async def scenario():
+        workers = []
+        for name in ("w1", "w2"):
+            gov = OriginGovernor(db, owner=name, min_interval=1.05)
+            workers.append(Worker(repo, gov, name=name))
+        tasks = [asyncio.create_task(w.run()) for w in workers]
+        try:
+            batch = await run_until(repo, batch_id, timeout=60)
+        finally:
+            for w in workers:
+                w.request_stop()
+            await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=10)
+        return batch
+
+    batch = asyncio.run(scenario())
+    assert all(p["status"] == "ok" for p in batch["pages"]), batch["pages"]
+    entries = sorted(
+        (e for e in demo_wild.requests() if e["host"] == fast_host),
+        key=lambda e: e["received_at"],
+    )
+    assert len(entries) == 2, entries
+    gap = entries[1]["received_at"] - entries[0]["received_at"]
+    assert gap >= 1.0, f"双进程同源实际间隔不足 1 秒：{gap:.3f}s"
+    assert entries[1]["received_at"] >= entries[0]["finished_at"] - 0.001, "同源请求重叠"
 
 
 def test_cooldown_on_one_origin_does_not_block_another(demo, tmp_path):

@@ -52,6 +52,32 @@ def _source_status(governor: OriginGovernor, origin: str) -> dict[str, Any]:
     }
 
 
+def _queue_demo(settings: Settings) -> dict[str, Any]:
+    """URL set for the browser queuing demo.
+
+    The first ``slow_count`` origins each get a 2.4 s delayed article, which
+    fills all 8 connections of every collector process; the next origin gets
+    two fast articles that must wait for a connection.  Watching the demo
+    source log shows the two fast requests still starting >= 1 s apart — and,
+    if the batch is cancelled while they are queued, never starting at all.
+    """
+    origins = settings.demo_queue_origins
+    slow_count = max(0, min(settings.demo_queue_slow_count, max(0, len(origins) - 1)))
+    slow = origins[:slow_count]
+    fast = origins[slow_count : slow_count + 1]
+    slugs = ("alpha", "beta", "gamma", "delta", "epsilon", "zeta")
+    return {
+        "slow_urls": [
+            f"{origin}/article/{slugs[i % len(slugs)]}?delay=2.4"
+            for i, origin in enumerate(slow)
+        ],
+        "fast_urls": (
+            [f"{fast[0]}/article/eta", f"{fast[0]}/article/theta"] if fast else []
+        ),
+        "slow_count": slow_count,
+    }
+
+
 def build_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
     settings.ensure_data_dir()
@@ -112,6 +138,7 @@ def build_app(settings: Settings | None = None) -> FastAPI:
                 {"name": "演示源 A", "base": settings.demo_a_url},
                 {"name": "演示源 B", "base": settings.demo_b_url},
             ],
+            "queue_demo": _queue_demo(settings),
         }
 
     @app.post("/api/batches", status_code=201)
@@ -228,6 +255,23 @@ def build_app(settings: Settings | None = None) -> FastAPI:
         except httpx.HTTPError as exc:
             raise HTTPException(
                 status_code=502, detail=f"无法读取演示源请求日志：{exc.__class__.__name__}"
+            ) from exc
+
+    @app.post("/api/demo/{source}/reset")
+    async def demo_reset(source: str) -> dict[str, Any]:
+        """Clear a demo source's request log (used before a queuing demo)."""
+        bases = {"a": settings.demo_a_url, "b": settings.demo_b_url}
+        base = bases.get(source)
+        if not base:
+            raise HTTPException(status_code=404, detail="未知演示源")
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.post(f"{base.rstrip('/')}/reset")
+                resp.raise_for_status()
+                return resp.json()
+        except httpx.HTTPError as exc:
+            raise HTTPException(
+                status_code=502, detail=f"无法清空演示源请求日志：{exc.__class__.__name__}"
             ) from exc
 
     static_dir = settings.static_dir

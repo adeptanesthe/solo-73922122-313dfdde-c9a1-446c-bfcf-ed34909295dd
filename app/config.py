@@ -47,6 +47,22 @@ MIN_INTERVAL_SECONDS = 1.05
 DEFAULT_DB = str(Path(__file__).resolve().parent.parent / "data" / "corpus.db")
 
 
+def _queue_demo_origins() -> list[str]:
+    """Origins used by the browser "queuing demo" button.
+
+    ``DEMO_QUEUE_ORIGINS`` is a comma-separated list of base URLs.  Inside
+    docker-compose these are network aliases of the demo-a container, so one
+    small service plays the role of many distinct sources.  The local default
+    uses loopback addresses 127.0.0.1 … 127.0.0.17 against a demo source on
+    port 8001 (Linux routes the whole 127/8 block to loopback).
+    """
+    raw = os.environ.get("DEMO_QUEUE_ORIGINS", "")
+    items = [item.strip().rstrip("/") for item in raw.split(",") if item.strip()]
+    if items:
+        return items
+    return [f"http://127.0.0.{i}:8001" for i in range(1, 18)]
+
+
 @dataclass
 class Settings:
     db_path: str = field(default_factory=lambda: os.environ.get("CORPUS_DB", DEFAULT_DB))
@@ -72,6 +88,13 @@ class Settings:
     )
     demo_b_url: str = field(
         default_factory=lambda: os.environ.get("DEMO_B_URL", "http://127.0.0.1:8002")
+    )
+    #: Origins for the queuing demo: the first ``demo_queue_slow_count`` get a
+    #: 2.4 s delayed article (filling every collector connection in each
+    #: process), the next one gets two fast articles that must queue.
+    demo_queue_origins: list[str] = field(default_factory=_queue_demo_origins)
+    demo_queue_slow_count: int = field(
+        default_factory=lambda: _int("DEMO_QUEUE_SLOW_COUNT", 16)
     )
 
     @property

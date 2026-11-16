@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 from app.api import build_app
 from app.config import Settings
+from tests.demo_server import DemoServer
 
 
 @pytest.fixture()
@@ -155,3 +157,64 @@ def test_index_page_served(client):
     resp = client.get("/")
     assert resp.status_code == 200
     assert "文章语料采集器" in resp.text
+
+
+def test_config_exposes_queue_demo(client):
+    demo = client.get("/api/config").json()["queue_demo"]
+    assert demo["slow_count"] == 16
+    assert len(demo["slow_urls"]) == 16
+    assert len(demo["fast_urls"]) == 2
+    # 17 distinct origins: 16 slow ones fill both processes' connections,
+    # the 17th carries the two fast articles that must queue.
+    origins = {url.split("/article/")[0] for url in demo["slow_urls"] + demo["fast_urls"]}
+    assert len(origins) == 17
+    assert all("delay=2.4" in url for url in demo["slow_urls"])
+    fast_origin = demo["fast_urls"][0].split("/article/")[0]
+    assert all(url.startswith(fast_origin) for url in demo["fast_urls"])
+
+
+def test_config_queue_demo_respects_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEMO_QUEUE_ORIGINS", "http://s1:8001, http://s2:8001 ,http://s3:8001")
+    monkeypatch.setenv("DEMO_QUEUE_SLOW_COUNT", "2")
+    settings = Settings(db_path=str(tmp_path / "corpus.db"), enable_collector=False)
+    with TestClient(build_app(settings)) as c:
+        demo = c.get("/api/config").json()["queue_demo"]
+    assert [u.split("/article/")[0] for u in demo["slow_urls"]] == [
+        "http://s1:8001",
+        "http://s2:8001",
+    ]
+    assert [u.split("/article/")[0] for u in demo["fast_urls"]] == ["http://s3:8001"] * 2
+
+
+@pytest.fixture()
+def demo_client(tmp_path):
+    with DemoServer() as server:
+        settings = Settings(
+            db_path=str(tmp_path / "corpus.db"),
+            enable_collector=False,
+            demo_a_url=f"http://127.0.0.1:{server.port}",
+        )
+        with TestClient(build_app(settings)) as c:
+            yield c, server
+
+
+def test_demo_requests_proxy_and_reset(demo_client):
+    client, server = demo_client
+    base = f"http://127.0.0.1:{server.port}"
+    httpx.get(f"{base}/article/alpha", headers={"host": "a1:8001"})
+    data = client.get("/api/demo/a/requests").json()
+    assert data["source"] == "demo-test"
+    assert len(data["requests"]) == 1
+    entry = data["requests"][0]
+    assert entry["path"] == "/article/alpha"
+    assert entry["host"] == "a1:8001"
+    assert entry["received_at"] > 0
+
+    assert client.post("/api/demo/a/reset").json() == {"ok": True}
+    assert client.get("/api/demo/a/requests").json()["requests"] == []
+
+
+def test_demo_proxy_unknown_source(demo_client):
+    client, _ = demo_client
+    assert client.get("/api/demo/c/requests").status_code == 404
+    assert client.post("/api/demo/c/reset").status_code == 404

@@ -21,10 +21,21 @@
           placeholder="http://demo-a:8001/article/alpha&#10;http://demo-b:8001/article/beta"></textarea>
         <div class="row">
           <button type="submit" id="submit-btn">开始采集</button>
+          <button type="button" class="ghost" id="queue-demo-btn">填入排队演示</button>
           <span id="submit-hint" class="hint">只采集给定 URL，不跟随重定向。</span>
         </div>
         <div id="form-error" class="error" hidden></div>
       </form>
+
+      <div class="demo-help" id="queue-demo-help" hidden>
+        <h3>排队演示说明</h3>
+        <p>已填入 <span id="queue-slow-count">16</span> 个不同源的慢文章（各延迟 2.4 秒，恰好占满两个采集进程的全部连接）
+          和 1 个第 17 源的两篇快文章。提交后：</p>
+        <ul>
+          <li>快文章先排队等连接——在下方「源站请求日志」中可看到它们<strong>实际开始仍相隔 ≥ 1 秒</strong>；</li>
+          <li>提交后约 2 秒内点「取消批次」，排队中的快文章<strong>不会再访问源站</strong>（日志中不会出现该源）。</li>
+        </ul>
+      </div>
 
       <div class="demo-help">
         <h3>演示源示例</h3>
@@ -43,6 +54,25 @@
         <button type="button" class="ghost" id="refresh-btn">刷新</button>
       </div>
       <div id="batches" class="batches"><p class="empty">还没有批次。</p></div>
+    </section>
+
+    <section class="panel" id="source-log-panel">
+      <div class="row space-between">
+        <h2>源站请求日志（演示源 A，含全部演示别名）</h2>
+        <div class="row">
+          <label class="hint" for="source-log-toggle" style="margin:0">
+            <input type="checkbox" id="source-log-toggle" checked> 自动刷新
+          </label>
+          <button type="button" class="ghost" id="source-log-clear">清空日志</button>
+        </div>
+      </div>
+      <p class="hint">按实际到达时间排序；同源两次请求的「到达时间」应相隔至少 1 秒且不重叠。</p>
+      <table class="pages" id="source-log-table">
+        <thead>
+          <tr><th>到达时间</th><th>源（Host）</th><th>路径</th><th>状态</th><th>耗时</th></tr>
+        </thead>
+        <tbody id="source-log-body"></tbody>
+      </table>
     </section>
 
     <section class="panel" id="detail-panel" hidden>

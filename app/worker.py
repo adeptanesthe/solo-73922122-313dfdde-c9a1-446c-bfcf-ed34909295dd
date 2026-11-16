@@ -5,9 +5,13 @@ A worker loop repeatedly:
 1. reads runnable pages (shared by every process through SQLite),
 2. for each origin picks one page whose origin is currently free, claims it
    and acquires the shared origin slot,
-3. checks the batch is still live *after* acquiring the slot (so a request is
-   never sent for a cancelled batch), sends exactly one GET,
-4. stores the result only if the batch was not cancelled while the request
+3. waits for a free per-process connection slot *here* — never inside the
+   httpx pool — so that a batch cancelled while its request is queued for a
+   connection is never sent, and so the shared pacing anchor is stamped at
+   the moment the request really leaves,
+4. checks the batch is still live *after* acquiring the connection slot (so
+   a request is never sent for a cancelled batch), sends exactly one GET,
+5. stores the result only if the batch was not cancelled while the request
    was in flight.
 
 All waiting is per-origin and asynchronous, so a cooldown on one source never
@@ -34,6 +38,17 @@ log = logging.getLogger("collector.worker")
 #: How long a dispatcher sleeps when every origin is blocked.
 IDLE_SLEEP = 0.25
 
+#: Connections per process.  The httpx pool is capped at the same number, so
+#: a request that holds a local connection slot is always assigned a
+#: connection immediately (httpcore closes an idle keep-alive connection to
+#: make room if needed) and never queues inside httpx.  All queuing happens
+#: on :attr:`Worker._conn_slots`, where cancellation can still stop the
+#: request and where the dispatch anchor has not been stamped yet.
+MAX_CONNECTIONS = 8
+
+#: How often a request queued for a connection re-checks batch cancellation.
+QUEUE_POLL_SECONDS = 0.2
+
 
 class Worker:
     def __init__(
@@ -44,6 +59,7 @@ class Worker:
         name: str = "worker",
         retry_after_fallback: int = 2,
         max_retry_after: int | None = None,
+        max_connections: int = MAX_CONNECTIONS,
     ) -> None:
         self.repo = repo
         self.governor = governor
@@ -51,6 +67,8 @@ class Worker:
         self.worker_id = f"{name}-{uuid.uuid4().hex[:8]}"
         self.retry_after_fallback = retry_after_fallback
         self.max_retry_after = max_retry_after
+        self.max_connections = max_connections
+        self._conn_slots = asyncio.Semaphore(max_connections)
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._stop = asyncio.Event()
         self._wake = asyncio.Event()
@@ -61,7 +79,10 @@ class Worker:
         async with httpx.AsyncClient(
             follow_redirects=False,
             timeout=fetchmod.TIMEOUT,
-            limits=httpx.Limits(max_connections=8, max_keepalive_connections=4),
+            limits=httpx.Limits(
+                max_connections=self.max_connections,
+                max_keepalive_connections=min(4, self.max_connections),
+            ),
         ) as client:
             self._client = client
             log.info("worker %s started (pid=%s)", self.worker_id, os.getpid())
@@ -131,19 +152,49 @@ class Worker:
             not t.done() and t.get_name().endswith(suffix) for t in self._tasks.values()
         )
 
+    async def _await_connection(self, batch_id: str) -> bool:
+        """Wait for a free per-process connection slot.
+
+        Returns ``False`` if the batch was cancelled while queued: the
+        request must then never be sent.  Queuing here (instead of inside
+        the httpx pool) is what keeps the cancel window honest and makes the
+        dispatch anchor below coincide with the real request start.
+        """
+        while True:
+            if self.repo.is_cancelled(batch_id):
+                return False
+            try:
+                await asyncio.wait_for(
+                    self._conn_slots.acquire(), timeout=QUEUE_POLL_SECONDS
+                )
+            except asyncio.TimeoutError:
+                continue
+            if self.repo.is_cancelled(batch_id):
+                self._conn_slots.release()
+                return False
+            return True
+
     async def _process(self, page: dict, slot: Slot) -> None:
         page_id = page["id"]
         origin = page["origin"]
         batch_id = page["batch_id"]
         sent = False
+        conn_slot = False
         try:
             # Re-check under the slot: the batch may have been cancelled after
             # the claim, in which case no request may be sent at all.
             if self.repo.is_cancelled(batch_id):
                 self.repo.cancel_claimed_page(page_id, "批次已取消，未发出的请求不再发送")
                 return
-            # Anchor the shared spacing at the moment we really dispatch, so
-            # the next request (in either process) starts >= 1s later.
+            # Wait for a connection *here*.  While queued, a cancel must
+            # still prevent the request from ever reaching the origin.
+            if not await self._await_connection(batch_id):
+                self.repo.cancel_claimed_page(page_id, "批次已取消，未发出的请求不再发送")
+                return
+            conn_slot = True
+            # Anchor the shared spacing only now that the request can leave
+            # immediately, so the next request (in either process) starts
+            # >= 1s after this one actually starts.
             if not self.governor.mark_dispatched(slot):
                 # Our lease expired (this process stalled): do not send.
                 self.repo.requeue_page(page_id, 0.5, "等待源站空闲后重试")
@@ -162,6 +213,8 @@ class Worker:
             log.exception("page %s failed unexpectedly", page_id)
             self.repo.save_failure(page_id, "internal", f"内部错误：{exc.__class__.__name__}")
         finally:
+            if conn_slot:
+                self._conn_slots.release()
             self.governor.release(slot, sent=sent)
             self._wake.set()
 

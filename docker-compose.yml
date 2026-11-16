@@ -13,6 +13,12 @@ services:
       RETRY_AFTER_FALLBACK: "2"
       DEMO_A_URL: http://demo-a:8001
       DEMO_B_URL: http://demo-b:8001
+      # 17 distinct origins for the queuing demo: a1…a17 are network aliases
+      # of the demo-a container, so one small service plays 17 sources.
+      # 16 slow ones fill both collector processes' 8 connections; the 17th
+      # gets two fast articles that must queue for a connection.
+      DEMO_QUEUE_ORIGINS: "http://a1:8001,http://a2:8001,http://a3:8001,http://a4:8001,http://a5:8001,http://a6:8001,http://a7:8001,http://a8:8001,http://a9:8001,http://a10:8001,http://a11:8001,http://a12:8001,http://a13:8001,http://a14:8001,http://a15:8001,http://a16:8001,http://a17:8001"
+      DEMO_QUEUE_SLOW_COUNT: "16"
       LOG_LEVEL: info
     volumes:
       - corpus-data:/data
@@ -37,6 +43,26 @@ services:
     environment:
       DEMO_NAME: demo-a
       LOG_LEVEL: info
+    networks:
+      default:
+        aliases:
+          - a1
+          - a2
+          - a3
+          - a4
+          - a5
+          - a6
+          - a7
+          - a8
+          - a9
+          - a10
+          - a11
+          - a12
+          - a13
+          - a14
+          - a15
+          - a16
+          - a17
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8001/healthz').read()"]
       interval: 3s

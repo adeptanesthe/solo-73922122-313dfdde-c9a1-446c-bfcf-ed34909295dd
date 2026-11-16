@@ -46,9 +46,10 @@ class RequestLog:
         self._lock = threading.Lock()
         self._entries: deque[dict[str, Any]] = deque(maxlen=capacity)
 
-    def start(self, method: str, path: str, query: str) -> dict[str, Any]:
+    def start(self, method: str, path: str, query: str, host: str = "") -> dict[str, Any]:
         entry: dict[str, Any] = {
             "method": method,
+            "host": host,
             "path": path,
             "query": query,
             "received_at": time.time(),
@@ -159,7 +160,10 @@ def create_app(name: str = "demo") -> FastAPI:
         limit = _int(request.query_params.get("limit"), 0, 0, 1000)
         retry_after = _int(request.query_params.get("retry_after"), 2, 0, 600)
 
-        entry = log.start(request.method, request.url.path, request.url.query)
+        entry = log.start(
+            request.method, request.url.path, request.url.query,
+            request.headers.get("host", ""),
+        )
         key = f"{slug}|{request.url.query}"
 
         if fail:
@@ -188,7 +192,10 @@ def create_app(name: str = "demo") -> FastAPI:
 
     @app.get("/redirect/{slug}")
     async def redirecting(slug: str, request: Request) -> Response:
-        entry = log.start(request.method, request.url.path, request.url.query)
+        entry = log.start(
+            request.method, request.url.path, request.url.query,
+            request.headers.get("host", ""),
+        )
         log.finish(entry, 302)
         return Response(
             status_code=302,
@@ -198,7 +205,10 @@ def create_app(name: str = "demo") -> FastAPI:
 
     @app.get("/no-article/{slug}", response_class=HTMLResponse)
     async def no_article(slug: str, request: Request) -> Response:
-        entry = log.start(request.method, request.url.path, request.url.query)
+        entry = log.start(
+            request.method, request.url.path, request.url.query,
+            request.headers.get("host", ""),
+        )
         log.finish(entry, 200)
         return HTMLResponse(
             "<html><body><h1>没有正文</h1><div>这个页面没有 article 元素。</div></body></html>"

@@ -16,10 +16,16 @@
   const cancelBtn = $("cancel-btn");
   const downloadLink = $("download-link");
   const refreshBtn = $("refresh-btn");
+  const queueDemoBtn = $("queue-demo-btn");
+  const queueDemoHelp = $("queue-demo-help");
+  const sourceLogBody = $("source-log-body");
+  const sourceLogToggle = $("source-log-toggle");
+  const sourceLogClear = $("source-log-clear");
 
   let currentBatch = null;
   let pollTimer = null;
   let maxUrls = 20;
+  let queueDemo = null;
 
   const STATUS_LABEL = {
     queued: "排队中",
@@ -80,6 +86,13 @@
       maxUrls = cfg.max_urls || 20;
       $("max-urls").textContent = String(maxUrls);
       urlsInput.placeholder = `http://demo-a:8001/article/alpha\nhttp://demo-b:8001/article/beta`;
+      queueDemo = cfg.queue_demo || null;
+      if (queueDemo && queueDemo.fast_urls && queueDemo.fast_urls.length) {
+        queueDemoBtn.disabled = false;
+        $("queue-slow-count").textContent = String(queueDemo.slow_count || 0);
+      } else {
+        queueDemoBtn.disabled = true;
+      }
       const sources = cfg.demo_sources || [];
       sources.forEach((source, index) => {
         const id = index === 0 ? "demo-a-base" : "demo-b-base";
@@ -318,16 +331,91 @@
     }
   }
 
+  function fillQueueDemo() {
+    if (!queueDemo) return;
+    const urls = [...(queueDemo.slow_urls || []), ...(queueDemo.fast_urls || [])];
+    if (!urls.length) return;
+    urlsInput.value = urls.join("\n");
+    queueDemoHelp.hidden = false;
+    showError("");
+  }
+
+  function fmtClock(ts) {
+    const d = new Date(ts * 1000);
+    const base = d.toLocaleTimeString("zh-CN", { hour12: false });
+    return `${base}.${String(d.getMilliseconds()).padStart(3, "0")}`;
+  }
+
+  async function refreshSourceLog() {
+    try {
+      const data = await api("/api/demo/a/requests");
+      const entries = (data.requests || [])
+        .slice()
+        .sort((a, b) => a.received_at - b.received_at)
+        .slice(-60);
+      sourceLogBody.textContent = "";
+      if (!entries.length) {
+        const tr = document.createElement("tr");
+        const td = document.createElement("td");
+        td.colSpan = 5;
+        td.className = "hint";
+        td.textContent = "（暂无请求）";
+        tr.appendChild(td);
+        sourceLogBody.appendChild(tr);
+        return;
+      }
+      for (const entry of entries) {
+        const tr = document.createElement("tr");
+        const when = document.createElement("td");
+        when.textContent = fmtClock(entry.received_at);
+        const host = document.createElement("td");
+        host.textContent = entry.host || "—";
+        const path = document.createElement("td");
+        path.className = "url";
+        path.textContent = entry.query ? `${entry.path}?${entry.query}` : entry.path;
+        const status = document.createElement("td");
+        status.textContent = entry.status == null ? "…" : String(entry.status);
+        const cost = document.createElement("td");
+        cost.textContent =
+          entry.finished_at == null
+            ? "进行中"
+            : `${(entry.finished_at - entry.received_at).toFixed(2)}s`;
+        tr.append(when, host, path, status, cost);
+        sourceLogBody.appendChild(tr);
+      }
+    } catch (err) {
+      /* demo source may be offline; keep the panel quiet */
+    }
+  }
+
+  async function clearSourceLog() {
+    sourceLogClear.disabled = true;
+    try {
+      await api("/api/demo/a/reset", { method: "POST" });
+      await refreshSourceLog();
+    } catch (err) {
+      showError(`清空日志失败：${err.message}`);
+    } finally {
+      sourceLogClear.disabled = false;
+    }
+  }
+
   form.addEventListener("submit", submit);
   refreshBtn.addEventListener("click", () => {
     refreshBatches();
     if (currentBatch) openBatch(currentBatch);
   });
   cancelBtn.addEventListener("click", cancelCurrent);
+  queueDemoBtn.addEventListener("click", fillQueueDemo);
+  sourceLogClear.addEventListener("click", clearSourceLog);
 
   loadConfig();
   refreshBatches();
+  refreshSourceLog();
   setInterval(() => {
     if (!currentBatch) refreshBatches();
   }, 4000);
+  setInterval(() => {
+    if (sourceLogToggle.checked) refreshSourceLog();
+  }, 1500);
 })();
